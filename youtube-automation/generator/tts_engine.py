@@ -1,6 +1,6 @@
 """
-TTS Engine: Text-to-speech using ElevenLabs (premium) with edge-tts fallback.
-ElevenLabs produces much more natural voices = better viewer retention.
+TTS Engine v2: Multi-provider with cost optimization.
+Priority: Google Cloud TTS (FREE 1M chars/mo) > Edge TTS (free) > Voxtral > ElevenLabs
 """
 
 import asyncio
@@ -9,21 +9,26 @@ from pathlib import Path
 from typing import Optional
 
 from config.settings import (
-    AUDIO_DIR, ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID_EN,
-    ELEVENLABS_VOICE_ID_ES, ELEVENLABS_MODEL, ELEVENLABS_STABILITY,
-    ELEVENLABS_SIMILARITY
+    AUDIO_DIR, TTS_PROVIDER,
+    GOOGLE_CLOUD_PROJECT, GOOGLE_TTS_VOICE_EN, GOOGLE_TTS_VOICE_ES,
+    EDGE_TTS_VOICE_EN, EDGE_TTS_VOICE_ES,
+    ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID_EN, ELEVENLABS_VOICE_ID_ES,
+    ELEVENLABS_MODEL
 )
 
 
 class TTSEngine:
-    """Handles text-to-speech conversion with premium and fallback options."""
+    """Multi-provider TTS with automatic fallback chain."""
 
-    def __init__(self):
-        self.use_elevenlabs = bool(ELEVENLABS_API_KEY)
+    PROVIDERS = ["google_cloud", "edge", "voxtral", "elevenlabs"]
+
+    def __init__(self, provider: Optional[str] = None):
+        self.provider = provider or TTS_PROVIDER
+        self.chars_used_google = 0  # Track free tier usage
 
     def generate_audio(self, text: str, language: str = "en",
                         output_filename: Optional[str] = None) -> Optional[Path]:
-        """Generate audio from text. Uses ElevenLabs if available, else edge-tts."""
+        """Generate audio with automatic provider fallback."""
         if not text.strip():
             return None
 
@@ -32,89 +37,130 @@ class TTSEngine:
             output_filename = f"audio_{language}_{text_hash}.mp3"
 
         output_path = AUDIO_DIR / output_filename
-
         if output_path.exists():
             return output_path
 
-        if self.use_elevenlabs:
-            result = self._generate_elevenlabs(text, language, output_path)
+        # Try providers in priority order
+        providers_to_try = [self.provider] + [p for p in self.PROVIDERS if p != self.provider]
+
+        for provider in providers_to_try:
+            result = self._generate_with_provider(provider, text, language, output_path)
             if result:
                 return result
-            print("[TTS] ElevenLabs failed, falling back to edge-tts")
+            print(f"[TTS] {provider} failed, trying next...")
 
-        return self._generate_edge_tts(text, language, output_path)
+        print("[TTS] All providers failed!")
+        return None
 
-    def _generate_elevenlabs(self, text: str, language: str, output_path: Path) -> Optional[Path]:
-        """Generate audio using ElevenLabs API."""
+    def _generate_with_provider(self, provider: str, text: str,
+                                  language: str, output_path: Path) -> Optional[Path]:
+        """Generate audio with a specific provider."""
         try:
-            from elevenlabs import ElevenLabs
-
-            client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
-
-            voice_id = ELEVENLABS_VOICE_ID_EN if language == "en" else ELEVENLABS_VOICE_ID_ES
-
-            audio = client.text_to_speech.convert(
-                voice_id=voice_id,
-                text=text,
-                model_id=ELEVENLABS_MODEL,
-                voice_settings={
-                    "stability": ELEVENLABS_STABILITY,
-                    "similarity_boost": ELEVENLABS_SIMILARITY
-                }
-            )
-
-            # Write audio bytes to file
-            with open(output_path, "wb") as f:
-                for chunk in audio:
-                    f.write(chunk)
-
-            print(f"[TTS] ElevenLabs audio saved: {output_path}")
-            return output_path
-
+            if provider == "google_cloud":
+                return self._generate_google_cloud(text, language, output_path)
+            elif provider == "edge":
+                return self._generate_edge_tts(text, language, output_path)
+            elif provider == "voxtral":
+                return self._generate_voxtral(text, language, output_path)
+            elif provider == "elevenlabs":
+                return self._generate_elevenlabs(text, language, output_path)
         except Exception as e:
-            print(f"[TTS] ElevenLabs error: {e}")
-            return None
+            print(f"[TTS] {provider} error: {e}")
+        return None
+
+    def _generate_google_cloud(self, text: str, language: str, output_path: Path) -> Optional[Path]:
+        """Google Cloud TTS - FREE 1M characters/month."""
+        from google.cloud import texttospeech
+
+        client = texttospeech.TextToSpeechClient()
+
+        voice_name = GOOGLE_TTS_VOICE_EN if language == "en" else GOOGLE_TTS_VOICE_ES
+        lang_code = "en-US" if language == "en" else "es-US"
+
+        input_text = texttospeech.SynthesisInput(text=text)
+        voice = texttospeech.VoiceSelectionParams(
+            language_code=lang_code,
+            name=voice_name
+        )
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.MP3,
+            speaking_rate=1.0,
+            pitch=0.0
+        )
+
+        response = client.synthesize_speech(
+            input=input_text, voice=voice, audio_config=audio_config
+        )
+
+        with open(output_path, "wb") as f:
+            f.write(response.audio_content)
+
+        self.chars_used_google += len(text)
+        print(f"[TTS] Google Cloud saved: {output_path} ({self.chars_used_google:,} chars used this session)")
+        return output_path
 
     def _generate_edge_tts(self, text: str, language: str, output_path: Path) -> Optional[Path]:
-        """Generate audio using edge-tts (free, Microsoft voices)."""
-        try:
-            import edge_tts
+        """Edge TTS - completely free, good quality."""
+        import edge_tts
 
-            voice_map = {
-                "en": "en-US-ChristopherNeural",
-                "es": "es-ES-AlvaroNeural"
-            }
-            voice = voice_map.get(language, voice_map["en"])
+        voice = EDGE_TTS_VOICE_EN if language == "en" else EDGE_TTS_VOICE_ES
 
-            async def _generate():
-                communicate = edge_tts.Communicate(text, voice)
-                await communicate.save(str(output_path))
+        async def _generate():
+            communicate = edge_tts.Communicate(text, voice)
+            await communicate.save(str(output_path))
 
-            asyncio.run(_generate())
-            print(f"[TTS] Edge-TTS audio saved: {output_path}")
-            return output_path
+        asyncio.run(_generate())
+        print(f"[TTS] Edge-TTS saved: {output_path}")
+        return output_path
 
-        except Exception as e:
-            print(f"[TTS] Edge-TTS error: {e}")
+    def _generate_voxtral(self, text: str, language: str, output_path: Path) -> Optional[Path]:
+        """Voxtral TTS (Mistral) - $0.016/1K chars, 47% cheaper than ElevenLabs."""
+        import requests
+
+        api_key = os.environ.get("MISTRAL_API_KEY", "")
+        if not api_key:
             return None
 
-    def generate_audio_chunks(self, sections: list[dict], language: str = "en") -> list[Path]:
-        """Generate separate audio files for each script section."""
-        audio_files = []
+        response = requests.post(
+            "https://api.mistral.ai/v1/audio/speech",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": "voxtral-mini", "input": text},
+            timeout=120
+        )
 
-        for i, section in enumerate(sections):
-            text = section.get("content", "")
-            if not text:
-                continue
+        if response.status_code == 200:
+            with open(output_path, "wb") as f:
+                f.write(response.content)
+            print(f"[TTS] Voxtral saved: {output_path}")
+            return output_path
+        return None
 
-            filename = f"section_{i:03d}_{language}.mp3"
-            audio_path = self.generate_audio(text, language, filename)
-            if audio_path:
-                audio_files.append(audio_path)
+    def _generate_elevenlabs(self, text: str, language: str, output_path: Path) -> Optional[Path]:
+        """ElevenLabs - premium quality, $0.13/video."""
+        if not ELEVENLABS_API_KEY:
+            return None
 
-        return audio_files
+        from elevenlabs import ElevenLabs
+
+        client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
+        voice_id = ELEVENLABS_VOICE_ID_EN if language == "en" else ELEVENLABS_VOICE_ID_ES
+
+        audio = client.text_to_speech.convert(
+            voice_id=voice_id, text=text, model_id=ELEVENLABS_MODEL,
+            voice_settings={"stability": 0.5, "similarity_boost": 0.75}
+        )
+
+        with open(output_path, "wb") as f:
+            for chunk in audio:
+                f.write(chunk)
+
+        print(f"[TTS] ElevenLabs saved: {output_path}")
+        return output_path
 
     def estimate_duration(self, text: str) -> float:
-        """Estimate audio duration in seconds from text length."""
-        word_count = len(text.split())
-        return word_count / 2.5  # ~150 words per minute = 2.5 words per second
+        """Estimate audio duration in seconds."""
+        return len(text.split()) / 2.5
+
+    def get_free_tier_remaining(self) -> int:
+        """Check remaining Google Cloud free tier chars."""
+        return max(0, 1_000_000 - self.chars_used_google)
